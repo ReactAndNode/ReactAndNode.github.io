@@ -1,0 +1,488 @@
+---
+title: "Backtesting Project"
+author: "A-B-G-I"
+date: "May 4, 2018"
+output: 
+  html_document :
+    number_sections: false
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: readable
+    highlight: tango
+---
+
+***
+***
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyverse)
+library(xtable)
+library(broom)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(magrittr)
+library(readxl)
+library(knitr)
+library(stringr)
+library(randomForest)
+library(DT)
+library(kableExtra)
+library(data.table)
+library(Hmisc)
+library(corrplot)
+library(lmtest)
+library(sandwich)
+```
+## Factors 
+
+### 12 JKKL Factors
+```{r echo = FALSE, results = 'asis'}
+text_tbl <- data.frame(
+  Number = c("1","2","3","4","5","6","7","8","9","10","11", "12"),
+  Factors = c("RETP", "RETP2", "TURN", "SIZE", "FREV", "LTG", "SUE", "SG", "TA", "CAPEX", "BP", "EP"),
+  Category = c("Momentum", "Momentum", "Trading Volume","Size", "Earning Surpirse", "Growth", "Earning Surprise", "Growth", "Earning Quality", "Growth", "Growth", "Growth"),
+  Descriptions = c(
+    "Cumulative Market Adjusted Return for the Preceding 6 Months",
+    "Cumulative Market Adjusted Return for the 2nd Preceding 6 Months", 
+    "Average Daily Volume Turnover",
+    "Market Cap (Natural Log)",
+    "Analyst earnings forecast revisions to price",
+    "Long-term growth forecast",
+    "Standardized unexpected earnings",
+    "Sales Growth",
+    "Total Accruals to total assets",
+    "Capital expenditures to total assets",
+    "Book to Price",
+    "Earnings to Price"
+  ),
+  Effect = c("pos", "pos", "neg", "neg", "pos", "neg", "pos", "neg", "neg", "neg", "pos", "pos")
+)
+
+kable(text_tbl, "html") %>%
+  kable_styling(full_width = F) %>%
+  column_spec(1, bold = T, border_right = T) %>%
+  column_spec(2, border_right = T) %>%
+  column_spec(3, border_right = T) %>%
+  column_spec(4, border_right = T) %>%
+  column_spec(5, border_right = T)
+# background = "yellow"
+```
+
+***
+***
+
+### The Factors We Picked
+```{r echo = FALSE,}
+text_tbl <- data.frame(
+  Number = c("13","14","15","16","17"),
+  Factors = c("DP", "Volume", "total Q", "Off Balance Sheet Asset(OffBS)", "M-Score"),
+  Descriptions = c(
+    "Historically, there has a been a positive relation between Dividend/Price or Dividend Yield and future returns",
+    "Firms with larger amounts of volume subsequently have lower furture returns", 
+    "Total Q is a new proxy for Tobin's Q.  Tobin's Q is traditionally Market Equity value + Market value of liabilities divided by equity book value + liabilities book value. Total Q includes intangible capital in the denominator.",
+    "what degree intangible capital is kept off of or not listed on the balance sheet",
+    "Attempts to encapsulate likelihood of firm-level earnings manipulation. This factor uses eight sub-factors calculated with compustat data; additionally, Beneish finds that firms with a score greater than -1.78 are more often than not earnings manipulators"
+  ),
+  Research = c("Litzenberger and Ramaswamy (1982)","Ang et al. (2006)",
+                "Peters and Taylor (2016)","Peters and Taylor (2016)","Beneish's paper")
+)
+
+kable(text_tbl, "html") %>%
+  kable_styling(full_width = F) %>%
+  column_spec(1, bold = T, border_right = T) %>%
+  column_spec(2, border_right = T) %>%
+  column_spec(3, border_right = T) %>%
+  column_spec(4, border_right = T)
+```
+
+***
+***
+
+## Model
+
+```{r include=FALSE, warning = FALSE}
+setwd("C:/Users/Bowin/Desktop/Spring2018/442/FinalPort")
+
+## Data Imports
+JKKL = fread('jkkl.csv')
+mk = fread('mk.csv')
+
+#crsp = as.data.table(read_csv("CRSP.csv"))
+
+crsp = fread("CRSP2.csv")
+link = fread("LinkingTable.csv")
+totalq = fread("totalq.csv")
+ff38 = setDT(read_excel("lab6_ffdata.xlsx", sheet = "sic38", range = "A1:D41", col_names = F))
+FFMonthly = setDT(read_excel("ff_data.xlsx", sheet = "2001_2013", range = "A1:F160"))
+
+setnames(crsp, c("permno", "date", "siccd", "ticker", "divamt", "prc", "ret", "shrout"))
+setnames(ff38, c("start", "end", "ind", "indname"))
+```
+
+
+
+```{r include=FALSE, warning = FALSE}
+# setting column names
+setnames(crsp, c("permno", "date", "siccd", "ticker", "divamt", "prc", "ret", "shrout"))
+setnames(ff38, c("start", "end", "ind", "indname"))
+
+# matching siccd to fama & french industry classification, merged so we have ind column, will be used for winsorize later
+crsp2 = crsp[!is.na(siccd) && siccd != 0]
+crsp2 = crsp2[, siccd := as.double(siccd)]
+crsp2 = crsp2[!is.na(siccd)]
+crsp2 = crsp2[ff38, on = list(siccd >= start, siccd <= end), nomatch = 0][, siccd.1 := NULL]
+
+# merging with link table on gvkey to get permno column, 297k obs before merge and 228k after merge, mostly matches, works no problem
+totalq2 = na.omit(totalq[link, on = "gvkey"])
+totalq2 = totalq2[, .SD, .SDcols = c("LPERMNO", "fyear", "q_tot", "K_int_offBS" )]
+setnames(totalq2, c("permno", "year", "q_tot", "K_int_offBS"))
+```
+
+
+
+```{r include=FALSE, warning = FALSE}
+# Get yearly returns from compunded monthly returns of all crsp stocks
+crsp2[, year := as.numeric(format(as.Date(date, format="%m/%d/%Y"), "%Y"))]
+crsp2[, month := format(as.Date(date, format="%m/%d/%Y"), "%m")]
+crsp2[, yearlyRet := prod(as.numeric(ret)+1)-1, by = .(permno, year)]
+crsp2 = na.omit(crsp2[month == 12][,c("date","month","ret"):=NULL])
+
+# choose the jkkl factors and some more
+JKKL2 = JKKL[, .SD, .SDcols = c("permno", "date", "compustat_date", "retp", "ret2p", "turn", "lagsize", "FREV", 
+                               "LTG", "SUE", "SG", "ta", "CAPEX", "bp", "EP", "VOL")]
+
+# use 4th quarter for yearly factor data
+JKKL2[, year := as.numeric(format(as.Date(compustat_date, format="%m/%d/%Y"), "%Y"))+1]
+JKKL2[, month := format(as.Date(date, format="%m/%d/%Y"), "%m")]
+JKKL2 = JKKL2[month == 12][,c("date","month"):=NULL]
+
+# merge the tables together by permno and year to have all the columns with factors we want
+Data = na.omit(as.data.table(left_join(JKKL2, crsp2, by= c("permno","year")))[,c("compustat_date"):=NULL])
+Data = na.omit(as.data.table(left_join(Data, totalq2, by= c("permno","year"))))
+# mk table is too small after merge with link
+#Data = na.omit(as.data.table(left_join(Data, mk2, by= c("permno","year"))))
+Data[, DP := divamt/prc][,c("divamt","prc"):=NULL]
+
+# the factors we will use, the x variables we will use to predict y (monthly returns)
+X_factors = colnames(Data)[c(2:14,22:24)]
+
+# winsorize regressors
+Wins = function(x, left, right) { 
+  q = quantile(x, c(left,right), type = 5)
+  indx = findInterval(x, q,left.open = TRUE)
+  x[indx == 0] <- q[[1]]
+  x[indx == 2] <- q[[2]]
+  x
+}
+
+
+# clean data with winsorizing, not removing but changing outliers to farthest non outlier value
+Data = Data[, c(.(permno = permno, ind=ind, yearlyRet=yearlyRet), lapply(.SD, function(x) Wins(as.numeric(x), 0.025,0.975))), by = "year", .SDcols = X_factors]
+
+```
+
+
+### Data/Factors 
+***In-Sample *** 1985-1998
+
+
+***Out-sample*** 1985-2013
+
+Here's what the Datatable looks like: 
+```{r}
+head(Data,5)
+```
+
+***
+
+```{r include=FALSE, warning = FALSE}
+
+# stadardize all of the factors by getting the z-scores, maintaing same distibution of the per factor per year data, but it doesn't matter what units of measurements were used since we will normalize them
+Data = Data[, paste0("z", X_factors) := lapply(.SD, function(x) as.vector(scale(as.numeric(x)))),.SDcols = X_factors, by = .(year)]
+# Dividing Samples between in-sample training and out-sample testing
+start = 1985
+end = 1998
+years = end - start + 1
+
+Data_In = Data %>%
+  filter(year >= start) %>%
+  filter(year <= end) %>%
+  na.omit
+
+Data_Out = Data %>%
+  filter(year > end)%>%
+  na.omit
+
+Data = as.data.table(Data)
+Data_In = as.data.table(Data_In)
+Data_Out = as.data.table(Data_Out)
+
+```
+
+```{r include = FALSE, warning = FALSE}
+# Spearman rank correlation by year
+names(Data_In)
+ZX_factors = paste0("z", X_factors)
+corrs = Data_In[, lapply(.SD, function(x) cor(yearlyRet, x, method = "spearman")),.SDcols = ZX_factors, by = "year"][, year := NULL]
+# adjust for one year correlation 
+model = lm(as.matrix(corrs) ~ 1)
+coeftest(model, vcov = NeweyWest(model, lag = 1, prewhite = F))
+
+## Training 
+coefficients = Data_In[, as.list(coef(lm(yearlyRet ~ zretp + zret2p + zturn + zlagsize + zFREV + zLTG + zSUE + zSG + zta + zCAPEX + zbp + zEP + zDP + zVOL + zq_tot + zK_int_offBS))), by = "year"]
+(coefMean = apply(coefficients[, .SD, .SDcol = - "year"], 2, mean))
+(coefSd = apply(coefficients[, .SD, .SDcol = - "year"], 2, sd))
+(tStat = coefMean / coefSd * sqrt(years))
+# pick the factors with tstat > 1.5 and the right sign according to publiched academic papers (for example negative for size, positive for bp)
+
+# TODO: Find all pairwise factor correlation, get rid of highly correlated ones
+
+
+
+## Testing
+#Data_Out[, score := zretp * tStat[2] + zret2p * tStat[3] + zturn * tStat[4] + zlagsize * tStat[5] 
+#         + zFREV * tStat[6] + zLTG * tStat[7] + zSUE * tStat[8] + zSG * tStat[9] + zta * tStat[10] 
+#         + zCAPEX * tStat[11] + zbp * tStat[12] + zEP * tStat[13] + zDP * tStat[14] + zVOL * tStat[15] + zq_tot * tStat[16] + zK_int_offBS * tStat[17]]
+# the significant factors that were picked
+Data_Out[, score := zretp * tStat[2] + zret2p * tStat[3] + zlagsize * tStat[5] + zLTG * tStat[7] + zSUE * tStat[8] + zta * tStat[10] + zbp * tStat[12] + + zDP * tStat[14] + zq_tot * tStat[16] + zK_int_offBS * tStat[17]]
+Data_Out[, group := findInterval(score, quantile(score, c(0.1, 0.9), type = 5)), by = "year"]
+Data_Out[group == 0, trade := "S"]
+Data_Out[group == 2, trade := "L"]
+Data_Out = Data_Out[trade %in% c("L", "S"), .(permno, year, score, trade)]
+
+# clean data_out
+Data_Out = crsp %>% 
+  mutate(year = as.numeric(year(as.Date(date, format="%m/%d/%Y")))) %>%
+  mutate(month = as.numeric(month(as.Date(date, format="%m/%d/%Y")))) %>%
+  mutate(date = format(as.Date(date, format="%m/%d/%Y"), "%Y/%m")) %>%
+  mutate(ret = as.numeric(ret)) %>%
+  left_join(Data_Out, by= c("permno","year")) %>%
+  select(permno, date, year, month, score, trade, ret) %>%
+  na.omit()
+```
+
+
+```{r include=FALSE, warning = FALSE}
+# calculate monthly portfolio returns 
+Data_Out = as.data.table(Data_Out)
+Port = Data_Out[, .(pRet = mean(ret)), by = c("date", "trade")][order(date, trade)]
+(Performance = rbind(Port, data.table(date = unique(Port[, date]), trade = "LS",
+                                      pRet = Port[trade == "L", pRet] - Port[trade == "S", pRet]))[order(date)])
+PerformanceLS = Performance[trade %in% "LS"]
+
+
+## Performance Evaluation
+FFMonthly[,year := floor(X__1/100)]
+FFMonthly[,month := X__1%%100]
+FFMonthly$date <- with(FFMonthly, sprintf("%d/%02d", year, month))
+Res=PerformanceLS[FFMonthly,on = list(date=date), nomatch = 0]
+
+```
+
+
+### Results: 
+```{r echo=FALSE, warning = FALSE}
+
+# compute excess returns = raw return -risk free rate
+Res[, r_excess := (pRet*100) - RF]
+# simple average of annulized raw returns
+message(c('Simple return: ', (Res[, mean(pRet*100)] * 12)))
+
+# simple average of annulized excess returns
+message(c('Annulized raw return: ', (Res[, mean(r_excess)] * 12)))
+
+# geometric average of annulized raw 
+message(c('Geometric average of annulized raw: ',((Res[, prod(1 + pRet)^(1/nrow(Res)) - 1]) * 12 *100)))
+
+# geometric average of annulized excess returns
+message(c('Geometric average of annulized excess returns: ',((Res[, prod(1 + r_excess/100)^(1/nrow(Res)) - 1]) * 12 *100)))
+
+# monthly sharpe ratio 
+sr = Res[, mean(r_excess) / sd(r_excess)]
+message(c('Monthly sharpe ratio: ', (srannual = sr * sqrt(12))))
+# annualized sharpe ratio 
+
+# CAPM, time series regression for Security Characteristic Line
+
+message(c('CAPM '))
+CAPM = lm(r_excess ~ `Mkt-RF`, data = Res)
+summary(CAPM)
+# FF 3 factor, time series regression
+message(c('FF 3 factor, time series regression '))
+FF3 = lm(r_excess ~ `Mkt-RF`+ SMB + HML, data = Res)
+summary(FF3)
+# Corhart 4 factor
+message(c('Carhart 4 factor '))
+C4 = lm(r_excess ~ `Mkt-RF` + SMB + HML + Mom, data = Res)
+summary(C4)
+
+# Monthly information ratio under Fama French 3 factor model
+message(c('Monthly information ratio under Fama French 3 factor model: ', (IF_ff3 = coef(FF3)[1] / sd(FF3$residuals))))
+
+# Annualized FF3 IR
+message(c('Annualized FF3 IR: ',(annual_IF_ff3 = IF_ff3*sqrt(12))))
+
+
+# Monthly information ratio under Corhart 4 factor model
+message(c('Monthly information ratio under Corhart 4 factor model: ',
+(IF_c4 = coef(C4)[1] / sd(C4$residuals))))
+
+# Annualized C4 IR
+message(c('Annualized C4 IR: ',(annual_IF_c4 = IF_c4*sqrt(12))))
+```
+
+***
+***
+## Correlation 
+
+#### Correlation Matrix 
+```{r echo = FALSE, warning = FALSE, results='asis'}
+Cor_Data <- Data_In %>% 
+  select(21:36)
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+
+res <- round(cor(Cor_Data),2)
+
+upper<-res
+upper[upper.tri(res)]<-""
+upper<-as.data.frame(upper)
+#res
+print(xtable(upper), type="html")
+```
+
+
+***
+
+#### Corrgram 
+
+```{r echo = FALSE, warning = FALSE}
+res <- rcorr(as.matrix(Cor_Data))
+
+
+corrplot(res$r, type="upper", order="hclust", 
+           tl.col = "black", tl.srt = 45,
+         p.mat = res$P, sig.level = 0.01, insig = "blank")
+```
+
+
+
+***
+***
+
+## Improvements? 
+### Graphs and fitted stats
+
+```{r echo = FALSE, results = 'asis', warning = FALSE}
+Data %>% ggplot(mapping=aes(x=factor(year), y=yearlyRet)) + 
+  geom_violin() +
+  scale_x_discrete(breaks=seq(1980, 2015, 5))+
+   labs(title="standardized yearly return ",
+         x = "year",
+         y = "standardized yearly return") 
+```
+
+***
+
+```{r echo = FALSE, results = 'asis', warning = FALSE}
+Data_In1 <- Data_In %>% filter(year != 1999)
+
+gap_fit <- lm(formula = yearlyRet ~ year + zretp + zret2p + zturn + zlagsize + zFREV + zLTG + zSUE + zSG + zta + zCAPEX + zbp + zEP + zDP + zVOL + zq_tot + zK_int_offBS, data=Data_In1)
+
+gap_fit_stats <- gap_fit %>%
+  tidy()
+
+knitr::kable(gap_fit_stats, format = "markdown")
+```
+
+
+***
+
+
+```{r echo = FALSE, results = 'asis', warning = FALSE}
+augmented_gap_fit <- gap_fit %>%
+  augment()
+
+augmented_gap_fit %>%
+  ggplot(mapping=aes(x=factor(year), y=.resid)) +
+  geom_violin() +
+  labs(title="residuals vs. year ",
+         x = "year",
+         y = "residual") +
+  geom_hline(yintercept = 0)
+```
+
+***
+
+## What are we doing next? 
+
+### ML/ RF modeling  
+
+Dividing the training and testing randomly 80-20
+```{r eval=FALSE}
+set.seed(1234)
+  test_df <- final_df %>%
+  group_by(Direction) %>%
+  sample_frac(.2) %>%
+  ungroup()
+
+training_df <- final_df %>%
+  anti_join(test_df, by="RegionID")
+
+training_df
+```
+
+***
+
+Trainng the rf model 
+```{r eval=FALSE}
+rf <- randomForest(Direction~., data=training_df %>% select(-RegionID), ntree = 100)
+rf
+```
+
+
+10-fold Crossvalidation: Cross-validation is a technique to evaluate predictive models by partitioning the original sample into a training set to train the model, and a test set to evaluate it. 
+
+Note: In k-fold cross-validation, the original sample is randomly partitioned into k equal size subsamples. Of the k subsamples, a single subsample is retained as the validation data for testing the model, and the remaining k-1 subsamples are used as training data. The cross-validation process is then repeated k times (the folds), with each of the k subsamples used exactly once as the validation data. The k results from the folds can then be averaged (or otherwise combined) to produce a single estimation. The advantage of this method is that all observations are used for both training and validation, and each observation is used for validation exactly once.
+```{r eval=FALSE}
+result_df <- createFolds(final_df$Direction, k=10) %>%
+  purrr::imap(function(test_indices, fold_number) {
+    train_df <- final_df %>%
+      select(-RegionID) %>%
+      slice(-test_indices)
+
+    test_df <- final_df %>%
+      select(-RegionID) %>%
+      slice(test_indices)
+  
+    # fit the two models
+    rf <- randomForest(Direction~., data=train_df, ntree=100)
+    
+    dt <- randomForest(Direction~., data=train_df, ntree=10)
+}) %>%
+  purrr::reduce(bind_rows)
+result_df
+
+result_df %>%
+  mutate(error_rf = observed_label != predicted_label_rf,
+         error_dt = observed_label != predicted_label_dt) %>%
+  group_by(fold) %>%
+  summarize(rf = mean(error_rf), dt = mean(error_dt)) %>%
+  tidyr::gather(model, error, -fold) %>%
+  lm(error~model, data=.) %>%
+  broom::tidy()
+```
+
+
+***
+***
